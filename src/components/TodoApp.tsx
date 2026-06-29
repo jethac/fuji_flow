@@ -10,6 +10,7 @@ import {
   FileQuestion,
   LinkIcon,
   Loader2,
+  Mic,
   Pencil,
   Phone,
   Plus,
@@ -27,6 +28,7 @@ import type {
   ContextQuestion,
   TaskOutcome,
 } from "@/lib/agent/types";
+import type { ExtractedTask, SharpenQuestion } from "@/lib/task-intelligence";
 import { isProviderLookupTask } from "@/lib/provider-lookup/intent";
 import {
   TODO_STORAGE_KEY,
@@ -130,6 +132,11 @@ export function TodoApp() {
   const [selectedId, setSelectedId] = useState<string>(starterTodos[0]?.id);
   const [newTitle, setNewTitle] = useState("");
   const [newNotes, setNewNotes] = useState("");
+  const [voiceOpen, setVoiceOpen] = useState(false);
+  const [voiceText, setVoiceText] = useState("");
+  const [voiceStatus, setVoiceStatus] = useState("Paste a task dump or record audio.");
+  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder>();
+  const [recordedChunks, setRecordedChunks] = useState<Blob[]>([]);
   const [answerDrafts, setAnswerDrafts] = useState<Record<string, Record<string, string>>>({});
   const [busyAction, setBusyAction] = useState<string>();
   const [error, setError] = useState<string>();
@@ -179,6 +186,108 @@ export function TodoApp() {
     setSelectedId(todo.id);
     setNewTitle("");
     setNewNotes("");
+  }
+
+  function addExtractedTask(task: ExtractedTask) {
+    const todo = createTodo({
+      title: task.title,
+      notes: task.notes || task.sourceText,
+    });
+    setTodos((current) => [
+      {
+        ...todo,
+        taskPatch: task.taskPatch,
+        questions: (task.questions as SharpenQuestion[]).map((question) => ({
+          ...question,
+          taskId: todo.id,
+        })),
+      },
+      ...current,
+    ]);
+    setSelectedId(todo.id);
+  }
+
+  async function startVoiceRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setVoiceStatus("Recording is not available in this browser.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const chunks: Blob[] = [];
+      const recorder = new MediaRecorder(stream);
+      recorder.addEventListener("dataavailable", (event) => {
+        if (event.data.size > 0) chunks.push(event.data);
+      });
+      recorder.addEventListener("stop", async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        setRecordedChunks(chunks);
+        await transcribeAudio(chunks);
+      });
+      recorder.start();
+      setMediaRecorder(recorder);
+      setRecordedChunks([]);
+      setVoiceStatus("Recording. Stop when you are done.");
+    } catch (caught) {
+      setVoiceStatus(caught instanceof Error ? caught.message : "Could not start recording.");
+    }
+  }
+
+  function stopVoiceRecording() {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      setVoiceStatus("Transcribing audio...");
+      mediaRecorder.stop();
+    }
+  }
+
+  async function transcribeAudio(chunks = recordedChunks) {
+    const blob = new Blob(chunks, { type: chunks[0]?.type || "audio/webm" });
+    if (!blob.size) {
+      setVoiceStatus("No audio was recorded.");
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": blob.type },
+        body: blob,
+      });
+      const payload = (await response.json()) as { text?: string; error?: string };
+      if (!response.ok) throw new Error(payload.error || "Transcription failed.");
+      setVoiceText((current) => [current.trim(), payload.text].filter(Boolean).join("\n"));
+      setVoiceStatus("Transcribed. Review, then add tasks.");
+    } catch (caught) {
+      setVoiceStatus(caught instanceof Error ? caught.message : "Transcription failed.");
+    } finally {
+      setMediaRecorder(undefined);
+    }
+  }
+
+  async function addVoiceDumpTasks() {
+    const text = voiceText.trim();
+    if (!text) {
+      setVoiceStatus("Paste or record a task dump first.");
+      return;
+    }
+
+    setVoiceStatus("Extracting tasks with OpenAI...");
+    try {
+      const response = await fetch("/api/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "extract", text }),
+      });
+      const payload = (await response.json()) as { tasks?: ExtractedTask[]; error?: string };
+      if (!response.ok || !payload.tasks) throw new Error(payload.error || "Task extraction failed.");
+      payload.tasks.forEach(addExtractedTask);
+      setVoiceText("");
+      setVoiceOpen(false);
+      setVoiceStatus(`Added ${payload.tasks.length} task${payload.tasks.length === 1 ? "" : "s"}.`);
+    } catch (caught) {
+      setVoiceStatus(caught instanceof Error ? caught.message : "Task extraction failed.");
+    }
   }
 
   function setTodoCompleted(todo: Todo, completed: boolean) {
@@ -359,6 +468,15 @@ export function TodoApp() {
                 >
                   <Plus className="h-5 w-5" aria-hidden="true" />
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setVoiceOpen((open) => !open)}
+                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-[#ead8c8] bg-white text-[#6f5a4d] shadow-sm shadow-[#8c5d45]/5 transition hover:border-coral hover:text-coral focus:outline-none focus:ring-2 focus:ring-[#c85f4b]/20"
+                  aria-label="Voice dump"
+                  title="Voice dump"
+                >
+                  <Mic className="h-5 w-5" aria-hidden="true" />
+                </button>
               </div>
               <textarea
                 value={newNotes}
@@ -366,6 +484,40 @@ export function TodoApp() {
                 placeholder="Notes"
                 className="mt-2 min-h-20 w-full resize-none rounded-md border border-[#ead8c8] bg-[#fff8f1] px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-[#a58b7a] focus:border-coral focus:bg-white focus:ring-2 focus:ring-[#c85f4b]/15"
               />
+              {voiceOpen ? (
+                <div className="mt-3 rounded-lg border border-[#ead8c8] bg-[#fff8f1] p-3">
+                  <textarea
+                    value={voiceText}
+                    onChange={(event) => setVoiceText(event.target.value)}
+                    placeholder="Paste or record a rough task dump"
+                    className="min-h-28 w-full resize-none rounded-md border border-[#ead8c8] bg-white px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-[#a58b7a] focus:border-coral focus:ring-2 focus:ring-[#c85f4b]/15"
+                  />
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={mediaRecorder ? stopVoiceRecording : startVoiceRecording}
+                      className="inline-flex h-9 items-center gap-2 rounded-md border border-[#ead8c8] bg-white px-3 text-sm font-medium text-[#6f5a4d] transition hover:border-coral hover:text-coral"
+                    >
+                      {mediaRecorder ? (
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      ) : (
+                        <Mic className="h-4 w-4" aria-hidden="true" />
+                      )}
+                      {mediaRecorder ? "Stop" : "Record"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={addVoiceDumpTasks}
+                      disabled={!voiceText.trim()}
+                      className="inline-flex h-9 items-center gap-2 rounded-md bg-coral px-3 text-sm font-medium text-white shadow-sm shadow-[#c85f4b]/20 transition hover:bg-coral-strong disabled:cursor-not-allowed disabled:bg-[#d8b8aa] disabled:shadow-none"
+                    >
+                      <Plus className="h-4 w-4" aria-hidden="true" />
+                      Add tasks
+                    </button>
+                    <span className="text-xs text-[#806b5e]">{voiceStatus}</span>
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             <div className="flex min-h-0 flex-col gap-2 overflow-y-auto pr-1">
